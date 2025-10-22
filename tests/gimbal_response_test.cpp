@@ -3,7 +3,7 @@
 #include <opencv2/opencv.hpp>
 #include <thread>
 
-#include "io/cboard.hpp"
+#include "io/gimbal/gimbal.hpp"
 #include "io/command.hpp"
 #include "tools/exiter.hpp"
 #include "tools/logger.hpp"
@@ -52,7 +52,7 @@ int main(int argc, char * argv[])
   tools::Exiter exiter;
   tools::Plotter plotter;
 
-  io::CBoard cboard(config_path);
+  io::Gimbal gimbal(config_path);
 
   auto init_angle = 0;
   double slice = circle * 100;  //切片数=周期*帧率
@@ -65,7 +65,7 @@ int main(int argc, char * argv[])
   int count = 0;
 
   io::Command init_command{1, 0, 0, 0};
-  cboard.send(init_command);
+  gimbal.send(init_command.control, init_command.shoot, init_command.yaw, 0, 0, init_command.pitch, 0, 0);
   std::this_thread::sleep_for(5s);  //等待云台归零
 
   io::Command command{0};
@@ -83,7 +83,7 @@ int main(int argc, char * argv[])
 
     std::this_thread::sleep_for(1ms);
 
-    Eigen::Quaterniond q = cboard.imu_at(timestamp);
+    Eigen::Quaterniond q = gimbal.q(timestamp);
 
     Eigen::Vector3d eulers = tools::eulers(q, 2, 1, 0);
 
@@ -106,7 +106,7 @@ int main(int argc, char * argv[])
         count++;
       }
 
-      cboard.send(command);
+      gimbal.send(command.control, command.shoot, command.yaw, 0, 0, command.pitch, 0, 0);
       if (axis_index == 0) {
         data["cmd_yaw"] = command.yaw * 57.3;
         data["last_cmd_yaw"] = last_command.yaw * 57.3;
@@ -130,7 +130,7 @@ int main(int argc, char * argv[])
       command = {1, 0, tools::limit_rad(cmd_angle / 57.3), 0};
       count++;
 
-      cboard.send(command);
+      gimbal.send(command.control, command.shoot, command.yaw, 0, 0, command.pitch, 0, 0);
       data["cmd_yaw"] = command.yaw * 57.3;
       data["last_cmd_yaw"] = last_command.yaw * 57.3;
       data["gimbal_yaw"] = eulers[0] * 57.3;
@@ -150,7 +150,7 @@ int main(int argc, char * argv[])
         t += 2.4;
         last_t = t;
       }
-      cboard.send(command);
+      gimbal.send(command.control, command.shoot, command.yaw, 0, 0, command.pitch, 0, 0);
 
       data["t"] = t;
       data["cmd_yaw"] = command.yaw * 57.3;

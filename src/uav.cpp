@@ -42,7 +42,7 @@ int main(int argc, char * argv[])
   tools::Recorder recorder;
 
   io::Camera camera(config_path);
-  io::CBoard cboard(config_path);
+  io::Gimbal gimbal(config_path);
 
   auto_aim::Detector detector(config_path);
   auto_aim::Solver solver(config_path);
@@ -61,21 +61,21 @@ int main(int argc, char * argv[])
   Eigen::Quaterniond q;
   std::chrono::steady_clock::time_point t;
 
-  auto mode = io::Mode::idle;
-  auto last_mode = io::Mode::idle;
+  auto mode = io::GimbalMode::IDLE;
+  auto last_mode = io::GimbalMode::IDLE;
 
   while (!exiter.exit()) {
     camera.read(img, t);
-    q = cboard.imu_at(t - 1ms);
-    mode = cboard.mode;
+    q = gimbal.q(t - 1ms);
+    mode = gimbal.mode();
     // recorder.record(img, q, t);
     if (last_mode != mode) {
-      tools::logger()->info("Switch to {}", io::MODES[mode]);
+      tools::logger()->info("Switch to {}", gimbal.str(mode));
       last_mode = mode;
     }
 
     /// 自瞄
-    if (mode == io::Mode::auto_aim || mode == io::Mode::outpost) {
+    if (mode == io::GimbalMode::AUTO_AIM) {
       solver.set_R_gimbal2world(q);
 
       Eigen::Vector3d ypr = tools::eulers(solver.R_gimbal2world(), 2, 1, 0);
@@ -84,15 +84,15 @@ int main(int argc, char * argv[])
 
       auto targets = tracker.track(armors, t);
 
-      auto command = aimer.aim(targets, t, cboard.bullet_speed);
+      auto command = aimer.aim(targets, t, gimbal.state().bullet_speed);
 
       command.shoot = shooter.shoot(command, aimer, targets, ypr);
 
-      cboard.send(command);
+      gimbal.send(command.control, command.shoot, command.yaw, 0, 0, command.pitch, 0, 0);
     }
 
     /// 打符
-    else if (mode == io::Mode::small_buff || mode == io::Mode::big_buff) {
+    else if (mode == io::GimbalMode::SMALL_BUFF || mode == io::GimbalMode::BIG_BUFF) {
       buff_solver.set_R_gimbal2world(q);
 
       auto power_runes = buff_detector.detect(img);
@@ -100,16 +100,16 @@ int main(int argc, char * argv[])
       buff_solver.solve(power_runes);
 
       io::Command buff_command;
-      if (mode == io::Mode::small_buff) {
+      if (mode == io::GimbalMode::SMALL_BUFF) {
         buff_small_target.get_target(power_runes, t);
         auto target_copy = buff_small_target;
-        buff_command = buff_aimer.aim(target_copy, t, cboard.bullet_speed, true);
-      } else if (mode == io::Mode::big_buff) {
+        buff_command = buff_aimer.aim(target_copy, t, gimbal.state().bullet_speed, true);
+      } else if (mode == io::GimbalMode::BIG_BUFF) {
         buff_big_target.get_target(power_runes, t);
         auto target_copy = buff_big_target;
-        buff_command = buff_aimer.aim(target_copy, t, cboard.bullet_speed, true);
+        buff_command = buff_aimer.aim(target_copy, t, gimbal.state().bullet_speed, true);
       }
-      cboard.send(buff_command);
+      gimbal.send(buff_command.control, buff_command.shoot, buff_command.yaw, 0, 0, buff_command.pitch, 0, 0);
     }
 
     else

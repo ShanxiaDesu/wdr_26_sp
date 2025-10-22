@@ -6,7 +6,7 @@
 #include <thread>
 
 #include "io/camera.hpp"
-#include "io/cboard.hpp"
+#include "io/gimbal/gimbal.hpp"
 #include "io/ros2/publish2nav.hpp"
 #include "io/ros2/ros2.hpp"
 #include "io/usbcamera/usbcamera.hpp"
@@ -43,7 +43,7 @@ int main(int argc, char * argv[])
   auto config_path = cli.get<std::string>(0);
 
   io::ROS2 ros2;
-  io::CBoard cboard(config_path);
+  io::Gimbal gimbal(config_path);
   io::Camera camera(config_path);
   io::Camera back_camera("configs/camera.yaml");
   io::USBCamera usbcam1("video0", config_path);
@@ -64,7 +64,7 @@ int main(int argc, char * argv[])
 
   while (!exiter.exit()) {
     camera.read(img, timestamp);
-    Eigen::Quaterniond q = cboard.imu_at(timestamp - 1ms);
+    Eigen::Quaterniond q = gimbal.q(timestamp - 1ms);
     // recorder.record(img, q, timestamp);
 
     /// 自瞄核心逻辑
@@ -90,12 +90,12 @@ int main(int argc, char * argv[])
     if (tracker.state() == "lost")
       command = decider.decide(yolo, gimbal_pos, usbcam1, usbcam2, back_camera);
     else
-      command = aimer.aim(targets, timestamp, cboard.bullet_speed, cboard.shoot_mode);
+      command = aimer.aim(targets, timestamp, gimbal.state().bullet_speed);
 
     /// 发射逻辑
     command.shoot = shooter.shoot(command, aimer, targets, gimbal_pos);
 
-    cboard.send(command);
+    gimbal.send(command.control, command.shoot, command.yaw, 0, 0, command.pitch, 0, 0);
 
     /// ROS2通信
     Eigen::Vector4d target_info = decider.get_target_info(armors, targets);
@@ -176,14 +176,14 @@ int main(int argc, char * argv[])
     // 云台响应情况
     data["gimbal_yaw"] = gimbal_pos[0] * 57.3;
     data["gimbal_pitch"] = -gimbal_pos[1] * 57.3;
-    data["shootmode"] = cboard.shoot_mode;
+    // shootmode 已移除
     if (command.control) {
       data["cmd_yaw"] = command.yaw * 57.3;
       data["cmd_pitch"] = command.pitch * 57.3;
       data["cmd_shoot"] = command.shoot;
     }
 
-    data["bullet_speed"] = cboard.bullet_speed;
+    data["bullet_speed"] = gimbal.state().bullet_speed;
 
     plotter.plot(data);
 

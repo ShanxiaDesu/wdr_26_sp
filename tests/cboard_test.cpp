@@ -1,4 +1,4 @@
-#include "io/cboard.hpp"
+#include "io/gimbal/gimbal.hpp"
 
 #include <chrono>
 #include <opencv2/opencv.hpp>
@@ -25,18 +25,18 @@ int main(int argc, char * argv[])
 
   tools::Exiter exiter;
 
-  io::CBoard cboard(config_path);
+  io::Gimbal gimbal(config_path);
 
   while (!exiter.exit()) {
     auto timestamp = std::chrono::steady_clock::now();
 
     std::this_thread::sleep_for(1ms);
 
-    Eigen::Quaterniond q = cboard.imu_at(timestamp);
+    Eigen::Quaterniond q = gimbal.q(timestamp);
 
     Eigen::Vector3d eulers = tools::eulers(q, 2, 1, 0) * 57.3;
     tools::logger()->info("z{:.2f} y{:.2f} x{:.2f} degree", eulers[0], eulers[1], eulers[2]);
-    tools::logger()->info("bullet speed {:.2f} m/s", cboard.bullet_speed);
+    tools::logger()->info("bullet speed {:.2f} m/s", gimbal.state().bullet_speed);
   }
 
   return 0;

@@ -5,7 +5,7 @@
 #include <opencv2/opencv.hpp>
 
 #include "io/camera.hpp"
-#include "io/cboard.hpp"
+#include "io/gimbal/gimbal.hpp"
 #include "tasks/auto_aim/aimer.hpp"
 #include "tasks/auto_aim/multithread/commandgener.hpp"
 #include "tasks/auto_aim/shooter.hpp"
@@ -38,7 +38,7 @@ int main(int argc, char * argv[])
   tools::Plotter plotter;
   tools::Recorder recorder;
 
-  io::CBoard cboard(config_path);
+  io::Gimbal gimbal(config_path);
   io::Camera camera(config_path);
 
   auto_aim::YOLO detector(config_path, false);
@@ -51,16 +51,16 @@ int main(int argc, char * argv[])
   Eigen::Quaterniond q;
   std::chrono::steady_clock::time_point t;
 
-  auto mode = io::Mode::idle;
-  auto last_mode = io::Mode::idle;
+  auto mode = io::GimbalMode::IDLE;
+  auto last_mode = io::GimbalMode::IDLE;
 
   while (!exiter.exit()) {
     camera.read(img, t);
-    q = cboard.imu_at(t - 1ms);
-    mode = cboard.mode;
+    q = gimbal.q(t - 1ms);
+    mode = gimbal.mode();
 
     if (last_mode != mode) {
-      tools::logger()->info("Switch to {}", io::MODES[mode]);
+      tools::logger()->info("Switch to {}", gimbal.str(mode));
       last_mode = mode;
     }
 
@@ -74,9 +74,9 @@ int main(int argc, char * argv[])
 
     auto targets = tracker.track(armors, t);
 
-    auto command = aimer.aim(targets, t, cboard.bullet_speed);
+    auto command = aimer.aim(targets, t, gimbal.state().bullet_speed);
 
-    cboard.send(command);
+    gimbal.send(command.control, command.shoot, command.yaw, 0, 0, command.pitch, 0, 0);
   }
 
   return 0;
