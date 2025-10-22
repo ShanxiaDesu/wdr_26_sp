@@ -1,5 +1,6 @@
 #include "cboard.hpp"
 
+#include "tools/crc.hpp"
 #include "tools/math_tools.hpp"
 #include "tools/yaml.hpp"
 
@@ -8,15 +9,36 @@ namespace io
 CBoard::CBoard(const std::string & config_path)
 : mode(Mode::idle),
   shoot_mode(ShootMode::left_shoot),
-  bullet_speed(0),
-  queue_(5000),
-  can_(read_yaml(config_path), std::bind(&CBoard::callback, this, std::placeholders::_1))
-// 注意: callback的运行会早于Cboard构造函数的完成
+  bullet_speed(0)
 {
-  tools::logger()->info("[Cboard] Waiting for q...");
+  auto com_port = read_yaml(config_path);
+
+  try {
+    serial_.setPort(com_port);
+    serial_.open();
+  } catch (const std::exception & e) {
+    tools::logger()->error("[CBoard] Failed to open serial: {}", e.what());
+    exit(1);
+  }
+
+  // 启动接收线程
+  thread_ = std::thread(&CBoard::read_thread, this);
+
+  // 阻塞等待第一个数据
+  tools::logger()->info("[CBoard] Waiting for first quaternion...");
   queue_.pop(data_ahead_);
   queue_.pop(data_behind_);
-  tools::logger()->info("[Cboard] Opened.");
+  tools::logger()->info("[CBoard] Opened.");
+}
+
+CBoard::~CBoard()
+{
+  quit_ = true;
+  if (thread_.joinable()) thread_.join();
+  try {
+    serial_.close();
+  } catch (...) {
+  }
 }
 
 Eigen::Quaterniond CBoard::imu_at(std::chrono::steady_clock::time_point timestamp)
@@ -46,48 +68,124 @@ Eigen::Quaterniond CBoard::imu_at(std::chrono::steady_clock::time_point timestam
 
 void CBoard::send(Command command) const
 {
-  can_frame frame;
-  frame.can_id = send_canid_;
-  frame.can_dlc = 8;
-  frame.data[0] = (command.control) ? 1 : 0;
-  frame.data[1] = (command.shoot) ? 1 : 0;
-  frame.data[2] = (int16_t)(command.yaw * 1e4) >> 8;
-  frame.data[3] = (int16_t)(command.yaw * 1e4);
-  frame.data[4] = (int16_t)(command.pitch * 1e4) >> 8;
-  frame.data[5] = (int16_t)(command.pitch * 1e4);
-  frame.data[6] = (int16_t)(command.horizon_distance * 1e4) >> 8;
-  frame.data[7] = (int16_t)(command.horizon_distance * 1e4);
+  tx_data_.control = command.control ? 1 : 0;
+  tx_data_.shoot = command.shoot ? 1 : 0;
+  tx_data_.yaw = command.yaw;
+  tx_data_.pitch = command.pitch;
+  tx_data_.horizon_distance = command.horizon_distance;
+  tx_data_.crc16 = tools::get_crc16(
+    reinterpret_cast<uint8_t *>(const_cast<CBoard_TX_Data *>(&tx_data_)),
+    sizeof(tx_data_) - sizeof(tx_data_.crc16));
 
   try {
-    can_.write(&frame);
+    serial_.write(reinterpret_cast<uint8_t *>(const_cast<CBoard_TX_Data *>(&tx_data_)),
+                  sizeof(tx_data_));
   } catch (const std::exception & e) {
-    tools::logger()->warn("{}", e.what());
+    tools::logger()->warn("[CBoard] Failed to write serial: {}", e.what());
   }
 }
 
-void CBoard::callback(const can_frame & frame)
+bool CBoard::read(uint8_t * buffer, size_t size)
 {
-  auto timestamp = std::chrono::steady_clock::now();
+  try {
+    return serial_.read(buffer, size) == size;
+  } catch (const std::exception & e) {
+    return false;
+  }
+}
 
-  if (frame.can_id == quaternion_canid_) {
-    auto x = (int16_t)(frame.data[0] << 8 | frame.data[1]) / 1e4;
-    auto y = (int16_t)(frame.data[2] << 8 | frame.data[3]) / 1e4;
-    auto z = (int16_t)(frame.data[4] << 8 | frame.data[5]) / 1e4;
-    auto w = (int16_t)(frame.data[6] << 8 | frame.data[7]) / 1e4;
+void CBoard::read_thread()
+{
+  tools::logger()->info("[CBoard] read_thread started.");
+  int error_count = 0;
 
-    if (std::abs(x * x + y * y + z * z + w * w - 1) > 1e-2) {
-      tools::logger()->warn("Invalid q: {} {} {} {}", w, x, y, z);
-      return;
+  while (!quit_) {
+    // 连接错误过多时尝试重连
+    if (error_count > 5000) {
+      error_count = 0;
+      tools::logger()->warn("[CBoard] Too many errors, attempting to reconnect...");
+      reconnect();
+      continue;
     }
 
-    queue_.push({{w, x, y, z}, timestamp});
-  }
+    // 读取帧头 "SP"
+    if (!read(reinterpret_cast<uint8_t *>(&rx_data_), sizeof(rx_data_.head))) {
+      error_count++;
+      continue;
+    }
 
-  else if (frame.can_id == bullet_speed_canid_) {
-    bullet_speed = (int16_t)(frame.data[0] << 8 | frame.data[1]) / 1e2;
-    mode = Mode(frame.data[2]);
-    shoot_mode = ShootMode(frame.data[3]);
-    ft_angle = (int16_t)(frame.data[4] << 8 | frame.data[5]) / 1e4;
+    // 检查帧头
+    if (rx_data_.head[0] != 'S' || rx_data_.head[1] != 'P') continue;
+
+    // 记录接收时间戳
+    auto timestamp = std::chrono::steady_clock::now();
+
+    // 读取剩余数据
+    if (!read(reinterpret_cast<uint8_t *>(&rx_data_) + sizeof(rx_data_.head),
+              sizeof(rx_data_) - sizeof(rx_data_.head))) {
+      error_count++;
+      continue;
+    }
+
+    // CRC16校验
+    if (!tools::check_crc16(reinterpret_cast<uint8_t *>(&rx_data_), sizeof(rx_data_))) {
+      tools::logger()->debug("[CBoard] CRC16 check failed.");
+      continue;
+    }
+
+    error_count = 0;
+
+    // 解析四元数 (wxyz顺序)
+    Eigen::Quaterniond q(rx_data_.q[0], rx_data_.q[1], rx_data_.q[2], rx_data_.q[3]);
+    queue_.push({{q.normalized()}, timestamp});
+
+    // 更新状态信息
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+
+      bullet_speed = rx_data_.bullet_speed;
+      ft_angle = rx_data_.ft_angle;
+
+      // 工作模式转换
+      switch (rx_data_.mode) {
+        case 0:
+          mode = Mode::idle;
+          break;
+        case 1:
+          mode = Mode::auto_aim;
+          break;
+        case 2:
+          mode = Mode::small_buff;
+          break;
+        case 3:
+          mode = Mode::big_buff;
+          break;
+        case 4:
+          mode = Mode::outpost;
+          break;
+        default:
+          mode = Mode::idle;
+          tools::logger()->warn("[CBoard] Invalid mode: {}", rx_data_.mode);
+          break;
+      }
+
+      // 射击模式转换
+      switch (rx_data_.shoot_mode) {
+        case 0:
+          shoot_mode = ShootMode::left_shoot;
+          break;
+        case 1:
+          shoot_mode = ShootMode::right_shoot;
+          break;
+        case 2:
+          shoot_mode = ShootMode::both_shoot;
+          break;
+        default:
+          shoot_mode = ShootMode::left_shoot;
+          tools::logger()->warn("[CBoard] Invalid shoot mode: {}", rx_data_.shoot_mode);
+          break;
+      }
+    }
 
     // 限制日志输出频率为1Hz
     static auto last_log_time = std::chrono::steady_clock::time_point::min();
@@ -100,22 +198,42 @@ void CBoard::callback(const can_frame & frame)
       last_log_time = now;
     }
   }
+
+  tools::logger()->info("[CBoard] read_thread stopped.");
 }
 
-// 实现方式有待改进
+void CBoard::reconnect()
+{
+  int max_retry_count = 10;
+  for (int i = 0; i < max_retry_count && !quit_; ++i) {
+    tools::logger()->warn("[CBoard] Reconnecting serial, attempt {}/{}...", i + 1, max_retry_count);
+    try {
+      serial_.close();
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    } catch (...) {
+    }
+
+    try {
+      serial_.open();  // 尝试重新打开
+      queue_.clear();
+      tools::logger()->info("[CBoard] Reconnected serial successfully.");
+      break;
+    } catch (const std::exception & e) {
+      tools::logger()->warn("[CBoard] Reconnect failed: {}", e.what());
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+  }
+}
+
 std::string CBoard::read_yaml(const std::string & config_path)
 {
   auto yaml = tools::load(config_path);
 
-  quaternion_canid_ = tools::read<int>(yaml, "quaternion_canid");
-  bullet_speed_canid_ = tools::read<int>(yaml, "bullet_speed_canid");
-  send_canid_ = tools::read<int>(yaml, "send_canid");
-
-  if (!yaml["can_interface"]) {
-    throw std::runtime_error("Missing 'can_interface' in YAML configuration.");
+  if (!yaml["com_port"]) {
+    throw std::runtime_error("Missing 'com_port' in YAML configuration.");
   }
 
-  return yaml["can_interface"].as<std::string>();
+  return yaml["com_port"].as<std::string>();
 }
 
 }  // namespace io

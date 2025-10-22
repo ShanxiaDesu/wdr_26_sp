@@ -242,6 +242,220 @@ sp_vision_25
     └── ...
 ```    
 
+### 3.6 CBoard 接口说明
+`CBoard` 类是视觉系统与下位机 C 板通信的核心接口，负责通过 CAN 总线或串口实现双向数据传输。该模块提供 IMU 姿态数据的时间戳查询与插值功能，同时向下位机发送云台控制指令。
+
+#### 3.6.1 主要功能
+1. **IMU 数据接收与插值**：接收下位机发送的姿态四元数，支持基于时间戳的 Slerp 插值查询
+2. **控制指令发送**：向下位机发送云台控制指令（yaw、pitch、射击标志等）
+3. **状态信息同步**：实时更新子弹速度、工作模式、射击模式等状态
+
+#### 3.6.2 核心数据结构
+
+**工作模式枚举**
+```cpp
+enum Mode {
+  idle,        // 空闲模式
+  auto_aim,    // 自瞄模式
+  small_buff,  // 小符模式
+  big_buff,    // 大符模式
+  outpost      // 前哨站模式
+};
+```
+
+**射击模式枚举（哨兵专用）**
+```cpp
+enum ShootMode {
+  left_shoot,   // 左侧射击
+  right_shoot,  // 右侧射击
+  both_shoot    // 双侧射击
+};
+```
+
+**公开成员变量**
+```cpp
+double bullet_speed;   // 子弹速度 (m/s)
+Mode mode;             // 当前工作模式
+ShootMode shoot_mode;  // 当前射击模式
+double ft_angle;       // FT 角度（无人机专用，单位：rad）
+```
+
+#### 3.6.3 核心接口
+
+**1. 构造函数**
+```cpp
+CBoard(const std::string & config_path);
+```
+- **参数**：`config_path` - YAML 配置文件路径
+- **功能**：初始化 CAN/串口通信，阻塞等待两个有效 IMU 数据包
+- **配置项**：
+  - `quaternion_canid`: 四元数数据的 CAN ID
+  - `bullet_speed_canid`: 状态数据的 CAN ID  
+  - `send_canid`: 发送指令的 CAN ID
+  - `can_interface`: CAN 接口名称（如 "can0"）或串口设备路径
+
+**2. IMU 数据查询**
+```cpp
+Eigen::Quaterniond imu_at(std::chrono::steady_clock::time_point timestamp);
+```
+- **参数**：`timestamp` - 目标时间戳
+- **返回**：对应时刻的姿态四元数（已归一化）
+- **算法**：使用 Slerp（球面线性插值）在相邻两个 IMU 数据间插值
+- **注意**：该函数为阻塞式调用，会等待数据到达
+
+**3. 发送控制指令**
+```cpp
+void send(Command command) const;
+```
+- **参数**：`command` - 控制指令结构体，包含以下字段：
+  - `control` (bool): 控制权标志
+  - `shoot` (bool): 射击标志
+  - `yaw` (double): Yaw 角度增量（单位：rad）
+  - `pitch` (double): Pitch 角度增量（单位：rad）
+  - `horizon_distance` (double): 水平距离（单位：m）
+
+#### 3.6.4 CAN 通信协议
+
+**接收协议**
+
+*四元数帧*（`quaternion_canid`）：
+| 字节   | 内容     | 编码方式                        |
+|--------|----------|---------------------------------|
+| 0-1    | q.x      | int16_t，缩放因子 10000，大端序 |
+| 2-3    | q.y      | int16_t，缩放因子 10000，大端序 |
+| 4-5    | q.z      | int16_t，缩放因子 10000，大端序 |
+| 6-7    | q.w      | int16_t，缩放因子 10000，大端序 |
+
+*状态帧*（`bullet_speed_canid`）：
+| 字节   | 内容         | 编码方式                        |
+|--------|--------------|--------------------------------|
+| 0-1    | 子弹速度     | int16_t，缩放因子 100，大端序   |
+| 2      | 工作模式     | uint8_t，对应 Mode 枚举值       |
+| 3      | 射击模式     | uint8_t，对应 ShootMode 枚举值  |
+| 4-5    | FT 角度      | int16_t，缩放因子 10000，大端序 |
+
+**发送协议**
+
+*控制指令帧*（`send_canid`）：
+| 字节   | 内容         | 编码方式                        |
+|--------|--------------|--------------------------------|
+| 0      | 控制标志     | bool → 0/1                     |
+| 1      | 射击标志     | bool → 0/1                     |
+| 2-3    | Yaw 角度     | int16_t，缩放因子 10000，大端序 |
+| 4-5    | Pitch 角度   | int16_t，缩放因子 10000，大端序 |
+| 6-7    | 水平距离     | int16_t，缩放因子 10000，大端序 |
+
+#### 3.6.5 使用示例
+
+```cpp
+#include "io/cboard.hpp"
+
+int main() {
+  // 1. 初始化 CBoard
+  io::CBoard board("configs/infantry3.yaml");
+  
+  // 2. 查询某时刻的姿态
+  auto timestamp = std::chrono::steady_clock::now();
+  Eigen::Quaterniond q = board.imu_at(timestamp);
+  
+  // 3. 读取状态信息
+  if (board.mode == io::Mode::auto_aim) {
+    tools::logger()->info("当前子弹速度: {:.2f} m/s", board.bullet_speed);
+  }
+  
+  // 4. 发送控制指令
+  io::Command cmd;
+  cmd.control = true;       // 接管控制权
+  cmd.shoot = false;        // 不射击
+  cmd.yaw = 0.05;           // Yaw 增量 0.05 rad
+  cmd.pitch = -0.02;        // Pitch 增量 -0.02 rad
+  cmd.horizon_distance = 3.5; // 目标距离 3.5m
+  board.send(cmd);
+  
+  return 0;
+}
+```
+
+#### 3.6.6 设计特点
+
+**线程安全**
+- 使用 `ThreadSafeQueue` 在 CAN 接收线程和主线程间传递数据
+- 成员变量初始化顺序经过精心设计，避免竞态条件
+
+**时间同步**
+- 在数据接收端立即打上时间戳，确保时间基准统一
+- Slerp 插值算法保证旋转姿态的平滑过渡
+
+**鲁棒性设计**
+- 四元数模长校验（容差 0.01），过滤无效数据
+- CAN 发送异常捕获与日志记录
+- 状态信息日志限流（1Hz），避免日志刷屏
+
+**双指针插值算法**
+- 维护 `data_ahead_` 和 `data_behind_` 两个数据点
+- 滑动窗口机制夹住目标时间戳，实现高效插值查询
+
+#### 3.6.7 注意事项
+
+1. **阻塞特性**：构造函数和 `imu_at()` 为阻塞式调用，请确保 CAN 数据正常到达
+2. **缩放因子**：不同字段使用不同缩放因子（10000 或 100），需与下位机协议保持一致
+3. **字节序**：所有多字节数据采用大端序编码
+4. **时间延迟**：IMU 数据传输和处理存在延迟（约 15ms），需在轨迹规划中补偿
+5. **配置文件**：确保 YAML 配置文件包含所有必需字段，否则会抛出异常
+
+#### 3.6.8 CBoard 串口通信实现（V2）
+
+在 25 赛季后期，我们将 CBoard 的通信方式从 CAN 改为串口，以与 Gimbal 模块保持通信协议一致。主要改进包括：
+
+**通信协议**
+```
+接收帧结构体 (CBoard_RX_Data):
+├─ head[2]          : 帧头 "SP" (0x53 0x50)
+├─ q[4]             : float型四元数 (w, x, y, z)
+├─ bullet_speed     : double型子弹速度
+├─ mode             : uint8_t 工作模式
+├─ shoot_mode       : uint8_t 射击模式（哨兵专用）
+├─ ft_angle         : float FT角度（无人机专用）
+└─ crc16            : uint16_t CRC16校验
+
+发送帧结构体 (CBoard_TX_Data):
+├─ head[2]          : 帧头 "SP"
+├─ control          : uint8_t 控制标志
+├─ shoot            : uint8_t 射击标志
+├─ yaw              : float Yaw角度 (rad)
+├─ pitch            : float Pitch角度 (rad)
+├─ horizon_distance : float 水平距离 (m)
+└─ crc16            : uint16_t CRC16校验
+```
+
+**关键实现特性**
+- ✅ **独立接收线程**：异步处理串口数据，不阻塞主线程
+- ✅ **自动重连机制**：连接错误超过 5000 次后自动重连
+- ✅ **CRC16校验**：确保数据完整性
+- ✅ **错误恢复**：通过帧头同步快速定位错误帧
+- ✅ **互斥锁保护**：线程安全的状态更新
+
+**配置文件示例**
+```yaml
+# 替代原有的 CAN 配置
+# can_interface: "can0"
+# quaternion_canid: 0x200
+# bullet_speed_canid: 0x201
+# send_canid: 0x202
+
+# 新的串口配置
+com_port: "/dev/gimbal"  # 或其他串口设备路径
+```
+
+**性能对比**
+| 指标 | CAN 方案 | 串口方案 |
+|------|---------|---------|
+| 通信接口 | SocketCAN (异步中断) | serial::Serial (主动轮询) |
+| 数据格式 | 二进制CAN帧 | 结构化数据包 + CRC16 |
+| 故障恢复 | 困难（需要配置CAN设置） | 简单（自动重连） |
+| 集成度 | 较低（需要单独CAN设备） | 较高（USB虚拟串口） |
+| 协议统一性 | 与Gimbal不同 | 与Gimbal相同 ✓ |
+
 
 ## 4 轨迹视角下的自瞄理论
 ### 4.1 引言
